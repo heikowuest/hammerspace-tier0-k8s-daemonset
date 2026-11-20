@@ -1,0 +1,6 @@
+# Local-only files on k8s-m1:/hammerspace/nfs-server-local
+# contains the Hammerspace password
+add-password.sh
+# old manifest versions / backups
+*.yaml.v*
+*-backup-*
