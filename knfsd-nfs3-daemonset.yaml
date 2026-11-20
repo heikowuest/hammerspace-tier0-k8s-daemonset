@@ -1,5 +1,63 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: knfsd-exporter
+  namespace: storage
+data:
+  start-nfs.sh: |
+    #!/usr/bin/env sh
+    set -eu
+
+    : "${ALLOW_CIDR:=10.49.101.0/24}"
+    : "${EXPORT_OPTS:=rw,nohide,sync,insecure,no_subtree_check,no_root_squash,sec=sys}"
+    : "${NFSD_THREADS:=64}"
+    : "${MOUNTD_PORT:=20048}"
+
+    EXPORT_PATH="/local"
+
+    echo "[knfsd] node=${NODE_NAME:-unknown} export=${EXPORT_PATH} allow=${ALLOW_CIDR} opts=${EXPORT_OPTS}"
+
+    if [ ! -d /proc/fs/nfsd ]; then
+      echo "[knfsd] ERROR: /proc/fs/nfsd missing"
+      exit 1
+    fi
+
+    if [ ! -f /proc/fs/nfsd/threads ]; then
+      mount -t nfsd nfsd /proc/fs/nfsd 2>/dev/null || true
+    fi
+
+    sysctl -w fs.nfs.nlm_tcpport=32768 >/dev/null 2>&1 || true
+    sysctl -w fs.nfs.nlm_udpport=32768 >/dev/null 2>&1 || true
+
+    rpcbind -w
+    rpc.statd --no-notify 2>/dev/null || true
+    rpc.mountd -F -p "${MOUNTD_PORT}" --manage-gids &
+
+    if [ -f /proc/fs/nfsd/versions ]; then
+      echo "+3 -4 -4.1 -4.2" > /proc/fs/nfsd/versions 2>/dev/null || true
+    fi
+
+    # el10_2+ kernels do not rpcbind-register listeners written to /proc/fs/nfsd/portlist
+    # (Hammerspace volume-add then fails). rpc.nfsd hands over sockets, which do get registered.
+    # Stop any nfsd left from a previous container first, so it registers with this rpcbind.
+    echo 0 > /proc/fs/nfsd/threads 2>/dev/null || true
+    rpc.nfsd -N 4 -N 4.1 -N 4.2 -V 3 -U -p 2049 "${NFSD_THREADS}"
+
+    cat > /etc/exports <<EOF
+    ${EXPORT_PATH} ${ALLOW_CIDR}(${EXPORT_OPTS})
+    EOF
+
+    exportfs -rav
+    exportfs -v || true
+
+    echo "[knfsd] ready"
+    tail -f /dev/null
 ---
 apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hammerspace-attach
+  namespace: storage
 data:
   attach-hammerspace.sh: |
     #!/usr/bin/env bash
@@ -430,72 +488,10 @@ data:
     fi
 
     tail -f /dev/null
-kind: ConfigMap
-metadata:
-  annotations: {}
-  name: hammerspace-attach
-  namespace: storage
----
-apiVersion: v1
-data:
-  start-nfs.sh: |
-    #!/usr/bin/env sh
-    set -eu
-
-    : "${ALLOW_CIDR:=10.49.101.0/24}"
-    : "${EXPORT_OPTS:=rw,nohide,sync,insecure,no_subtree_check,no_root_squash,sec=sys}"
-    : "${NFSD_THREADS:=64}"
-    : "${MOUNTD_PORT:=20048}"
-
-    EXPORT_PATH="/local"
-
-    echo "[knfsd] node=${NODE_NAME:-unknown} export=${EXPORT_PATH} allow=${ALLOW_CIDR} opts=${EXPORT_OPTS}"
-
-    if [ ! -d /proc/fs/nfsd ]; then
-      echo "[knfsd] ERROR: /proc/fs/nfsd missing"
-      exit 1
-    fi
-
-    if [ ! -f /proc/fs/nfsd/threads ]; then
-      mount -t nfsd nfsd /proc/fs/nfsd 2>/dev/null || true
-    fi
-
-    sysctl -w fs.nfs.nlm_tcpport=32768 >/dev/null 2>&1 || true
-    sysctl -w fs.nfs.nlm_udpport=32768 >/dev/null 2>&1 || true
-
-    rpcbind -w
-    rpc.statd --no-notify 2>/dev/null || true
-    rpc.mountd -F -p "${MOUNTD_PORT}" --manage-gids &
-
-    if [ -f /proc/fs/nfsd/versions ]; then
-      echo "+3 -4 -4.1 -4.2" > /proc/fs/nfsd/versions 2>/dev/null || true
-    fi
-
-    # el10_2+ kernels do not rpcbind-register listeners written to /proc/fs/nfsd/portlist
-    # (Hammerspace volume-add then fails). rpc.nfsd hands over sockets, which do get registered.
-    # Stop any nfsd left from a previous container first, so it registers with this rpcbind.
-    echo 0 > /proc/fs/nfsd/threads 2>/dev/null || true
-    rpc.nfsd -N 4 -N 4.1 -N 4.2 -V 3 -U -p 2049 "${NFSD_THREADS}"
-
-    cat > /etc/exports <<EOF
-    ${EXPORT_PATH} ${ALLOW_CIDR}(${EXPORT_OPTS})
-    EOF
-
-    exportfs -rav
-    exportfs -v || true
-
-    echo "[knfsd] ready"
-    tail -f /dev/null
-kind: ConfigMap
-metadata:
-  annotations: {}
-  name: knfsd-exporter
-  namespace: storage
 ---
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
-  annotations: {}
   name: knfsd-nfs3-hammerspace
   namespace: storage
 spec:
@@ -507,115 +503,120 @@ spec:
       labels:
         app: knfsd-nfs3-hammerspace
     spec:
-      containers:
-      - command:
-        - /bin/sh
-        - /config/start-nfs.sh
-        env:
-        - name: NODE_NAME
-          valueFrom:
-            fieldRef:
-              fieldPath: spec.nodeName
-        - name: ALLOW_CIDR
-          value: 10.49.101.0/24
-        - name: EXPORT_OPTS
-          value: rw,nohide,sync,insecure,no_subtree_check,no_root_squash,sec=sys
-        - name: NFSD_THREADS
-          value: "64"
-        - name: MOUNTD_PORT
-          value: "20048"
-        image: itsthenetwork/nfs-server-alpine:latest
-        imagePullPolicy: IfNotPresent
-        name: knfsd
-        ports:
-        - containerPort: 2049
-          name: nfs
-          protocol: TCP
-        - containerPort: 111
-          name: rpcbind-tcp
-          protocol: TCP
-        - containerPort: 111
-          name: rpcbind-udp
-          protocol: UDP
-        - containerPort: 20048
-          name: mountd-tcp
-          protocol: TCP
-        - containerPort: 20048
-          name: mountd-udp
-          protocol: UDP
-        securityContext:
-          privileged: true
-        volumeMounts:
-        - mountPath: /local
-          name: host-local
-        - mountPath: /config
-          name: nfs-config
-      - command:
-        - /bin/sh
-        - /scripts/run-attach-loop.sh
-        env:
-        - name: NODE_NAME
-          valueFrom:
-            fieldRef:
-              fieldPath: spec.nodeName
-        - name: NODE_IP
-          valueFrom:
-            fieldRef:
-              fieldPath: status.podIP
-        - name: HSMGMT_IP
-          value: 10.49.101.50
-        - name: HS_USER
-          value: admin
-        - name: HS_PASS
-          valueFrom:
-            secretKeyRef:
-              key: password
-              name: hammerspace-creds
-        - name: EXPORT_PATH
-          value: /local
-        - name: GRACE_SECONDS
-          value: "90"
-        - name: COOLDOWN_SECONDS
-          value: "600"
-        - name: BYPASS_DECOMMISSION
-          value: "true"
-        image: alpine:3.20
-        imagePullPolicy: IfNotPresent
-        name: attach
-        volumeMounts:
-        - mountPath: /scripts
-          name: attach-scripts
-        - mountPath: /local
-          name: host-local
-          readOnly: true
-        - mountPath: /state
-          name: tier0-state
-      dnsPolicy: ClusterFirstWithHostNet
-      hostNetwork: true
-      nodeSelector:
-        hammerspace-tier0: enabled
+      # included: your patch
       securityContext:
         seLinuxOptions:
           type: spc_t
+
+      nodeSelector:
+        hammerspace-tier0: "enabled"
+
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+
       tolerations:
-      - effect: NoSchedule
-        key: node-role.kubernetes.io/control-plane
-        operator: Exists
-      - effect: NoSchedule
-        key: node-role.kubernetes.io/master
-        operator: Exists
+        - key: "node-role.kubernetes.io/control-plane"
+          operator: "Exists"
+          effect: "NoSchedule"
+        - key: "node-role.kubernetes.io/master"
+          operator: "Exists"
+          effect: "NoSchedule"
+
+      containers:
+        - name: knfsd
+          image: itsthenetwork/nfs-server-alpine:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: ALLOW_CIDR
+              value: "10.49.101.0/24"
+            - name: EXPORT_OPTS
+              value: "rw,nohide,sync,insecure,no_subtree_check,no_root_squash,sec=sys"
+            - name: NFSD_THREADS
+              value: "64"
+            - name: MOUNTD_PORT
+              value: "20048"
+          command: ["/bin/sh", "/config/start-nfs.sh"]
+          volumeMounts:
+            - name: host-local
+              mountPath: /local
+            - name: nfs-config
+              mountPath: /config
+          ports:
+            - name: nfs
+              containerPort: 2049
+              protocol: TCP
+            - name: rpcbind-tcp
+              containerPort: 111
+              protocol: TCP
+            - name: rpcbind-udp
+              containerPort: 111
+              protocol: UDP
+            - name: mountd-tcp
+              containerPort: 20048
+              protocol: TCP
+            - name: mountd-udp
+              containerPort: 20048
+              protocol: UDP
+
+        - name: attach
+          image: alpine:3.20
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: HSMGMT_IP
+              value: "10.49.101.50"
+            - name: HS_USER
+              value: "admin"
+            - name: HS_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: hammerspace-creds
+                  key: password
+            - name: EXPORT_PATH
+              value: "/local"
+            - name: GRACE_SECONDS
+              value: "90"
+            - name: COOLDOWN_SECONDS
+              value: "600"
+            - name: BYPASS_DECOMMISSION
+              value: "true"
+
+          command: ["/bin/sh", "/scripts/run-attach-loop.sh"]
+          volumeMounts:
+            - name: attach-scripts
+              mountPath: /scripts
+            - name: host-local
+              mountPath: /local
+              readOnly: true
+            - name: tier0-state
+              mountPath: /state
+
       volumes:
-      - hostPath:
-          path: /local
-          type: DirectoryOrCreate
-        name: host-local
-      - configMap:
-          defaultMode: 493
-          name: knfsd-exporter
-        name: nfs-config
-      - configMap:
-          defaultMode: 493
-          name: hammerspace-attach
-        name: attach-scripts
-      - emptyDir: {}
-        name: tier0-state
+        - name: host-local
+          hostPath:
+            path: /local
+            type: DirectoryOrCreate
+        - name: nfs-config
+          configMap:
+            name: knfsd-exporter
+            defaultMode: 0755
+        - name: attach-scripts
+          configMap:
+            name: hammerspace-attach
+            defaultMode: 0755
+        - name: tier0-state
+          emptyDir: {}
+

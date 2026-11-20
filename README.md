@@ -6,7 +6,16 @@ Namespace `storage`, runs on nodes labelled `hammerspace-tier0=enabled`.
 
 ## Contents
 
-`knfsd-nfs3-hammerspace.yaml` holds:
+Source of truth, copied from `k8s-m1:/hammerspace/nfs-server-local`.
+
+| File | Purpose |
+|---|---|
+| `knfsd-nfs3-daemonset.yaml` | The manifest (objects below) |
+| `deploy.sh` | Creates namespace `storage` and applies the manifest |
+| `remove.sh` | Deletes everything in the manifest |
+| `add-label.sh` | Labels k8s-w1..w3 with `hammerspace-tier0=enabled` |
+
+`knfsd-nfs3-daemonset.yaml` holds:
 
 | Object | Purpose |
 |---|---|
@@ -14,15 +23,21 @@ Namespace `storage`, runs on nodes labelled `hammerspace-tier0=enabled`.
 | ConfigMap `knfsd-exporter` | `start-nfs.sh`: starts rpcbind, statd, mountd and kernel nfsd (NFSv3 only) and exports `/local`. |
 | DaemonSet `knfsd-nfs3-hammerspace` | Containers `knfsd` (privileged, hostNetwork) and `attach`. |
 
-Not included, create them separately:
+Not in this repo: the Secret `hammerspace-creds` (key `password`, the Hammerspace admin password). On m1 it is created by `add-password.sh`, which is kept out of git because it contains the password.
 
-- Namespace `storage`
-- Secret `hammerspace-creds` with key `password` (Hammerspace admin password)
+## Deploy
 
 ```bash
+./add-label.sh
 kubectl create namespace storage
 kubectl -n storage create secret generic hammerspace-creds --from-literal=password='<hammerspace-admin-password>'
-kubectl apply -f knfsd-nfs3-hammerspace.yaml
+./deploy.sh
+```
+
+Check that the files match the cluster before and after changes:
+
+```bash
+kubectl diff -f knfsd-nfs3-daemonset.yaml   # exit 0 = no differences
 ```
 
 ## Rocky Linux 10.2 kernel (el10_2): nfsd start fix
