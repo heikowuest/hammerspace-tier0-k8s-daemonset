@@ -8,14 +8,57 @@ data:
     #!/usr/bin/env sh
     set -eu
 
-    : "${ALLOW_CIDR:=10.49.101.0/24}"
-    : "${EXPORT_OPTS:=rw,nohide,sync,insecure,no_subtree_check,no_root_squash,sec=sys}"
-    : "${NFSD_THREADS:=64}"
+    # Allowed NFS clients = Hammerspace Anvil + DSX IPs (all interfaces except HA-only),
+    # written to $ALLOW_FILE by the attach container (refresh-allow-hosts.sh).
+    # Until that file exists: HS_ALLOW_FALLBACK if set, otherwise the node's own subnet.
+    : "${HS_ALLOW_FALLBACK:=}"
+    : "${ALLOW_FILE:=/hsallow/allow-hosts}"
+    : "${EXPORT_OPTS:=rw,sync,secure,no_subtree_check,no_root_squash,sec=sys}"
+    : "${NFSD_THREADS:=128}"
     : "${MOUNTD_PORT:=20048}"
+    : "${READ_AHEAD_KB:=4096}"
+    : "${WATCH_SECONDS:=30}"
+    : "${MOUNT_WAIT_SECONDS:=60}"
 
     EXPORT_PATH="/local"
 
-    echo "[knfsd] node=${NODE_NAME:-unknown} export=${EXPORT_PATH} allow=${ALLOW_CIDR} opts=${EXPORT_OPTS}"
+    log() { echo "[knfsd] $(date +%H:%M:%S) $*"; }
+
+    log "node=${NODE_NAME:-unknown} export=${EXPORT_PATH} opts=${EXPORT_OPTS} threads=${NFSD_THREADS}"
+
+    # --- /local must be the NVMe, never the root disk (replaces the 'mp' export option,
+    #     which cannot work here because /local is always a bind mount in the container)
+    local_source() {
+      awk '$5=="/local"{for(i=7;i<=NF;i++) if($i=="-"){print $(i+2); exit}}' /proc/self/mountinfo
+    }
+    waited=0
+    while :; do
+      src="$(local_source)"
+      case "$src" in
+        /dev/nvme*|/dev/md*) break ;;
+      esac
+      if [ "$waited" -ge "$MOUNT_WAIT_SECONDS" ]; then
+        log "ERROR: /local source='$src' is not an NVMe/MD device -> not exporting, restarting container"
+        exit 1
+      fi
+      sleep 5; waited=$((waited + 5))
+    done
+    log "/local is on $src"
+
+    # --- Tuning (Hammerspace Tier0 BKM, see BeratUlualan/Ansible-Tier0-1 perf_tuning)
+    tune() { sysctl -w "$1=$2" >/dev/null 2>&1 && log "sysctl $1=$2" || log "WARN: sysctl $1 failed"; }
+    tune net.core.rmem_max 268435456
+    tune net.core.wmem_max 268435456
+    tune net.ipv4.tcp_rmem "4096 87380 268435456"
+    tune net.ipv4.tcp_wmem "4096 65536 268435456"
+    tune net.core.netdev_max_backlog 250000
+    tune net.ipv4.tcp_mtu_probing 1
+    dev="$(basename "$src")"
+    if echo "$READ_AHEAD_KB" > "/sys/block/$dev/queue/read_ahead_kb" 2>/dev/null; then
+      log "read_ahead_kb $dev=$(cat /sys/block/$dev/queue/read_ahead_kb)"
+    else
+      log "WARN: could not set read_ahead_kb on $dev"
+    fi
 
     if [ ! -d /proc/fs/nfsd ]; then
       echo "[knfsd] ERROR: /proc/fs/nfsd missing"
@@ -43,15 +86,73 @@ data:
     echo 0 > /proc/fs/nfsd/threads 2>/dev/null || true
     rpc.nfsd -N 4 -N 4.1 -N 4.2 -V 3 -U -p 2049 "${NFSD_THREADS}"
 
-    cat > /etc/exports <<EOF
-    ${EXPORT_PATH} ${ALLOW_CIDR}(${EXPORT_OPTS})
-    EOF
+    # --- Self-test: NFS v3 must be registered with rpcbind (Hammerspace checks this)
+    nfs_registered() {
+      rpcinfo -p 2>/dev/null | awk '$1==100003 && $2==3 && $3=="tcp"{f=1} END{exit !f}'
+    }
+    if ! nfs_registered; then
+      log "ERROR: NFS v3 (100003) is not registered with rpcbind -> restarting container"
+      rpcinfo -p || true
+      exit 1
+    fi
+    log "NFS v3 registered with rpcbind"
 
-    exportfs -rav
-    exportfs -v || true
+    # --- Exports: one entry per allowed Hammerspace IP
+    # Fallback: the subnet of the interface that carries the node IP, e.g. 10.49.101.0/24
+    node_subnet() {
+      cidr="$(ip -o -4 addr show 2>/dev/null \
+        | awk -v ip="${NODE_IP:-}" '{split($4,a,"/"); if (a[1]==ip) {print $4; exit}}')"
+      [ -n "$cidr" ] || return 0
+      net="$(ipcalc -n "$cidr" 2>/dev/null | sed -n 's/^NETWORK=//p')"
+      if [ -n "$net" ]; then echo "$net/${cidr#*/}"; else echo "$cidr"; fi
+    }
+    write_exports() {
+      hosts=""; from=""
+      if [ -s "$ALLOW_FILE" ]; then
+        hosts="$(grep -E '^[0-9]+(\.[0-9]+){3}$' "$ALLOW_FILE" | tr '\n' ' ')"
+        from="api"
+      fi
+      if [ -z "$hosts" ] && [ -n "$HS_ALLOW_FALLBACK" ]; then
+        hosts="$HS_ALLOW_FALLBACK"; from="HS_ALLOW_FALLBACK"
+      fi
+      if [ -z "$hosts" ]; then
+        hosts="$(node_subnet)"; from="node subnet (fallback)"
+      fi
+      if [ -z "$hosts" ]; then
+        log "ERROR: no allow-list from API, no HS_ALLOW_FALLBACK and no node subnet for NODE_IP=${NODE_IP:-} -> restarting container"
+        exit 1
+      fi
+      line="$EXPORT_PATH"
+      for h in $hosts; do line="$line $h($EXPORT_OPTS)"; done
+      echo "$line" > /etc/exports
+      log "exports from $from: $hosts"
+    }
+    apply_exports() {
+      out="$(exportfs -ra 2>&1)" || { log "ERROR: exportfs failed: $out"; return 1; }
+      if [ -n "$out" ]; then log "ERROR: exportfs warned: $out"; return 1; fi
+      exportfs -v
+    }
 
-    echo "[knfsd] ready"
-    tail -f /dev/null
+    write_exports
+    apply_exports || exit 1
+    log "ready"
+
+    # --- Watch: re-export when the allow-list changes, restart if NFS drops out of rpcbind
+    sum() { cksum "$ALLOW_FILE" 2>/dev/null || echo none; }
+    last="$(sum)"
+    while :; do
+      sleep "$WATCH_SECONDS"
+      if ! nfs_registered; then
+        log "ERROR: NFS v3 no longer registered with rpcbind -> restarting container"
+        exit 1
+      fi
+      cur="$(sum)"
+      if [ "$cur" != "$last" ]; then
+        write_exports
+        apply_exports || log "WARN: keeping previous export state"
+        last="$cur"
+      fi
+    done
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -404,11 +505,60 @@ data:
     }
 
     main
+  refresh-allow-hosts.sh: |
+    #!/usr/bin/env bash
+    # Writes the NFS allow-list for the knfsd container: every IP of the Hammerspace
+    # Anvil and DSX nodes, except interfaces whose only role is HA.
+    # Only replaces the file when the API answered with a non-empty, valid list.
+    set -uo pipefail
+
+    : "${HSMGMT_IP:?set HSMGMT_IP}"
+    : "${HS_USER:=admin}"
+    : "${HS_PASS:?set HS_PASS}"
+    : "${ALLOW_FILE:=/hsallow/allow-hosts}"
+
+    B="https://${HSMGMT_IP}/mgmt/v1.2/rest"
+    C=(-sS -k --max-time 20 -u "${HS_USER}:${HS_PASS}" -H "Accept: application/json")
+    log() { echo "[${NODE_NAME:-unknown}][allow] $(date +%H:%M:%S) $*" >&2; }
+
+    nodes="$(curl "${C[@]}" "$B/nodes" \
+      | jq -c '[.[] | select(.productNodeType=="ANVIL" or .productNodeType=="DSX") | .name]')" \
+      || { log "WARN: /nodes query failed, keeping current list"; exit 1; }
+    ips="$(curl "${C[@]}" "$B/network-interfaces" \
+      | jq -r --argjson n "$nodes" '.[]
+          | select(.node.name as $x | $n | index($x))
+          | select((.roles // []) != ["HA"])
+          | .ipAddresses[]?.address' \
+      | grep -E '^[0-9]+(\.[0-9]+){3}$' | sort -u)" \
+      || { log "WARN: /network-interfaces query failed, keeping current list"; exit 1; }
+    if [ -z "$ips" ]; then
+      log "WARN: API returned no Anvil/DSX IPs, keeping current list"
+      exit 1
+    fi
+
+    tmp="$(mktemp "${ALLOW_FILE}.XXXXXX")"
+    echo "$ips" > "$tmp"
+    if cmp -s "$tmp" "$ALLOW_FILE"; then
+      rm -f "$tmp"
+    else
+      chmod 0644 "$tmp"
+      mv -f "$tmp" "$ALLOW_FILE"
+      log "allow-list updated: $(echo $ips)"
+    fi
   run-attach-loop.sh: |
     #!/usr/bin/env sh
     set -eu
 
     apk add --no-cache bash curl jq ca-certificates util-linux >/dev/null
+
+    # Keep the knfsd allow-list in sync with the Hammerspace Anvil/DSX IPs
+    (
+      set +e
+      while :; do
+        /scripts/refresh-allow-hosts.sh
+        sleep "${ALLOW_REFRESH_SECONDS:-300}"
+      done
+    ) &
 
     SENTINEL="${SENTINEL_DIR:-/local/Hammerspace}"
     GRACE_SECONDS="${GRACE_SECONDS:-90}"
@@ -533,20 +683,32 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
-            - name: ALLOW_CIDR
-              value: "10.49.101.0/24"
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            # Until the attach container has written /hsallow/allow-hosts from the
+            # Hammerspace API, the node's own subnet is exported. To use a fixed list
+            # instead, set e.g.:
+            # - name: HS_ALLOW_FALLBACK
+            #   value: "10.49.101.51 10.49.101.52 10.49.101.54 10.49.101.55"
             - name: EXPORT_OPTS
-              value: "rw,nohide,sync,insecure,no_subtree_check,no_root_squash,sec=sys"
+              value: "rw,sync,secure,no_subtree_check,no_root_squash,sec=sys"
             - name: NFSD_THREADS
-              value: "64"
+              value: "128"
             - name: MOUNTD_PORT
               value: "20048"
+            - name: READ_AHEAD_KB
+              value: "4096"
           command: ["/bin/sh", "/config/start-nfs.sh"]
           volumeMounts:
             - name: host-local
               mountPath: /local
             - name: nfs-config
               mountPath: /config
+            - name: hs-allow
+              mountPath: /hsallow
+              readOnly: true
           ports:
             - name: nfs
               containerPort: 2049
@@ -593,6 +755,8 @@ spec:
               value: "600"
             - name: BYPASS_DECOMMISSION
               value: "true"
+            - name: ALLOW_REFRESH_SECONDS
+              value: "300"
 
           command: ["/bin/sh", "/scripts/run-attach-loop.sh"]
           volumeMounts:
@@ -603,6 +767,8 @@ spec:
               readOnly: true
             - name: tier0-state
               mountPath: /state
+            - name: hs-allow
+              mountPath: /hsallow
 
       volumes:
         - name: host-local
@@ -619,4 +785,9 @@ spec:
             defaultMode: 0755
         - name: tier0-state
           emptyDir: {}
+        # Last known Hammerspace allow-list, kept on the node across pod restarts/reboots
+        - name: hs-allow
+          hostPath:
+            path: /var/lib/hammerspace-tier0
+            type: DirectoryOrCreate
 

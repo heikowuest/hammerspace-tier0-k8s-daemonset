@@ -40,6 +40,27 @@ Check that the files match the cluster before and after changes:
 kubectl diff -f knfsd-nfs3-daemonset.yaml   # exit 0 = no differences
 ```
 
+## NFS access: Hammerspace nodes only (dynamic)
+
+`/local` is exported only to the Hammerspace Anvil and DSX nodes, not to the whole subnet:
+
+- `refresh-allow-hosts.sh` (attach container) asks the Hammerspace API every `ALLOW_REFRESH_SECONDS` (300 s) for every IP of the nodes with `productNodeType` ANVIL or DSX, except interfaces whose only role is HA. Floating IPs are not included. The list goes to `/var/lib/hammerspace-tier0/allow-hosts` on the node, so the last known list survives pod restarts and reboots. The file is only replaced when the API returns a non-empty, valid list.
+- `start-nfs.sh` (knfsd container) writes one export entry per IP and re-exports with `exportfs -ra` within `WATCH_SECONDS` (30 s) when the file changes. New Anvil/DSX nodes are added, removed ones dropped, without a restart.
+- Fallback while no list exists yet: `HS_ALLOW_FALLBACK` if set, otherwise the subnet of the node's own interface (e.g. `10.49.101.0/24`).
+
+Export options: `rw,sync,secure,no_subtree_check,no_root_squash,sec=sys`.
+
+```bash
+showmount -e <node-ip>                                    # -> only the Anvil/DSX IPs
+kubectl -n storage exec <pod> -c knfsd -- cat /hsallow/allow-hosts
+```
+
+## Safety checks and tuning in start-nfs.sh
+
+- `/local` must be on an NVMe/MD device. Otherwise nothing is exported and the container restarts after `MOUNT_WAIT_SECONDS` (60 s). The `mp` export option cannot do this here, because `/local` is always a bind mount inside the container.
+- After start, NFS v3 (100003) must be registered with rpcbind, and `exportfs` must not print warnings; otherwise the container restarts. The watch loop restarts it too if NFS drops out of rpcbind.
+- Tuning from the Hammerspace Tier0 recommendations (see [BeratUlualan/Ansible-Tier0-1](https://github.com/BeratUlualan/Ansible-Tier0-1), role `perf_tuning`): `NFSD_THREADS=128`, read-ahead `READ_AHEAD_KB=4096` on the `/local` device, and host-wide TCP sysctls (`rmem/wmem_max` 256 MB, `tcp_rmem/tcp_wmem` up to 256 MB, `netdev_max_backlog` 250000, `tcp_mtu_probing=1`). Not applied because they don't fit VMware workers with one NUMA node: `pool_mode=pernode`, IRQ pinning, RDMA, `nfsd_direct_io`.
+
 ## Rocky Linux 10.2 kernel (el10_2): nfsd start fix
 
 After the worker kernel was updated to `6.12.0-211.74.1.el10_2` (2026-11-09), two things broke, one after the other:
