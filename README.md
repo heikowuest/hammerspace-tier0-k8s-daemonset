@@ -55,6 +55,21 @@ showmount -e <node-ip>                                    # -> only the Anvil/DS
 kubectl -n storage exec <pod> -c knfsd -- cat /hsallow/allow-hosts
 ```
 
+## Attaching the volume to Hammerspace (attach container)
+
+`run-attach-loop.sh` runs forever:
+
+- While `/local/Hammerspace` (the sentinel Hammerspace creates on the volume) exists, it only checks every `CHECK_SECONDS` (300 s) and makes no REST calls.
+- When the sentinel is missing, `attach-hammerspace.sh` registers the node if needed, **waits until Hammerspace reports a capacity > 0** for the `/local` logical volume (up to `LV_WAIT_TRIES` × `LV_WAIT_SECONDS` = 15 min; Hammerspace refreshes it only every few minutes and rejects 0-byte volumes), then adds `<node>::/local` and polls the task for up to 5 min (`WAIT_TRIES` × `WAIT_SECONDS`).
+- If that fails or the sentinel does not appear within `GRACE_SECONDS` (90 s), it retries every `RETRY_SECONDS` (300 s). **It never deletes the volume** unless `AUTO_RESET=true` is set.
+- `apk add` is retried every 30 s instead of crashing when the package mirror is not reachable (typical right after a reboot).
+
+Manual reset (deletes the Hammerspace volume; with `BYPASS_DECOMMISSION=true` this wipes the Tier0 data on that node):
+
+```bash
+kubectl -n storage exec <pod> -c attach -- bash /scripts/reset-hammerspace-volume.sh
+```
+
 ## Safety checks and tuning in start-nfs.sh
 
 - `/local` must be on an NVMe/MD device. Otherwise nothing is exported and the container restarts after `MOUNT_WAIT_SECONDS` (60 s). The `mp` export option cannot do this here, because `/local` is always a bind mount inside the container.
@@ -84,5 +99,4 @@ rpcinfo -T tcp <node-ip> nfs 3   # -> program 100003 version 3 ready and waiting
 Notes:
 
 - Only TCP is registered. `-U` has no effect with the nfs-utils 2.3.2 in the image; Hammerspace uses TCP.
-- After a volume has been missing, Hammerspace can keep a stale capacity of 0 bytes for the logical volume for several minutes (`Cannot add a volume which has 0 bytes of storage capacity`). The attach loop retries only once after `GRACE_SECONDS` (90 s), so a manual `kubectl -n storage exec <pod> -c attach -- bash /scripts/attach-hammerspace.sh` may be needed once the capacity shows up.
-- The reset path deletes the Hammerspace volume with `bypassDecommission=DataLossRiskAcknowledged`, which wipes the Tier0 data on that node.
+- After a volume has been missing, Hammerspace can keep a stale capacity of 0 bytes for the logical volume for several minutes (`Cannot add a volume which has 0 bytes of storage capacity`). `attach-hammerspace.sh` now waits for the capacity before adding the volume.

@@ -172,7 +172,11 @@ data:
     : "${EXPORT_PATH:=/local}"
 
     : "${WAIT_SECONDS:=3}"
-    : "${WAIT_TRIES:=40}"
+    : "${WAIT_TRIES:=100}"
+    # Hammerspace refreshes the logical volume capacity only every few minutes;
+    # a volume with 0 bytes is rejected, so wait up to LV_WAIT_TRIES*LV_WAIT_SECONDS.
+    : "${LV_WAIT_SECONDS:=10}"
+    : "${LV_WAIT_TRIES:=90}"
     : "${SKIP_PERF_TEST:=true}"
     : "${FORCE:=true}"
 
@@ -228,8 +232,10 @@ data:
     }
 
     add_node_if_needed() {
-      if hs_get "/nodes/${NODE_NAME}" >/dev/null 2>&1; then
-        log "node already exists (GET ok), continuing"
+      # curl exits 0 on HTTP errors too, so check the answer really is this node
+      if hs_get "/nodes/${NODE_NAME}" 2>/dev/null \
+          | jq -e --arg n "$NODE_NAME" 'type=="object" and .name==$n' >/dev/null 2>&1; then
+        log "node already exists, continuing"
         return 0
       fi
 
@@ -261,27 +267,32 @@ data:
 
     wait_for_logical_volume() {
       local i=0
-      while (( i < WAIT_TRIES )); do
+      while (( i < LV_WAIT_TRIES )); do
         ((i++)) || true
-        local node lv
-        node="$(hs_get "/nodes/${NODE_NAME}")"
+        local node lv cap
+        node="$(hs_get "/nodes/${NODE_NAME}" || true)"
         lv="$(echo "$node" | jq -c --arg p "$EXPORT_PATH" '
           .platformServices[]?
           | select(._type=="LOGICAL_VOLUME")
           | select(.name==$p)
-        ' | head -n1 || true)"
+        ' 2>/dev/null | head -n1 || true)"
 
         if [[ -n "$lv" ]]; then
-          echo "$node" > /tmp/hs_node.json
-          echo "$lv"
-          return 0
+          cap="$(echo "$lv" | jq -r '.totalCapacity // 0')"
+          if [[ "$cap" =~ ^[0-9]+$ ]] && (( cap > 0 )); then
+            log "LOGICAL_VOLUME ${EXPORT_PATH} ready, capacity=${cap}"
+            echo "$node" > /tmp/hs_node.json
+            echo "$lv"
+            return 0
+          fi
+          (( i == 1 || i % 6 == 0 )) && log "LOGICAL_VOLUME ${EXPORT_PATH} still reports capacity=${cap}, waiting for Hammerspace to refresh it ..."
+        else
+          (( i == 1 || i % 6 == 0 )) && log "waiting for LOGICAL_VOLUME ${EXPORT_PATH} on ${NODE_NAME} ..."
         fi
-
-        log "waiting for LOGICAL_VOLUME ${EXPORT_PATH} on ${NODE_NAME} ..."
-        sleep "$WAIT_SECONDS"
+        sleep "$LV_WAIT_SECONDS"
       done
 
-      log "ERROR: LOGICAL_VOLUME ${EXPORT_PATH} did not appear for ${NODE_NAME}"
+      log "ERROR: LOGICAL_VOLUME ${EXPORT_PATH} not usable for ${NODE_NAME} after $((LV_WAIT_TRIES * LV_WAIT_SECONDS))s"
       hs_get "/nodes/${NODE_NAME}" | jq -r '.platformServices[]? | select(._type=="LOGICAL_VOLUME") | .name' || true
       return 1
     }
@@ -549,7 +560,13 @@ data:
     #!/usr/bin/env sh
     set -eu
 
-    apk add --no-cache bash curl jq ca-certificates util-linux >/dev/null
+    log() { echo "[${NODE_NAME:-unknown}][attach] $(date +%H:%M:%S) $*" >&2; }
+
+    # The package mirror is often unreachable right after a node reboot: retry instead of crashing
+    until apk add --no-cache bash curl jq ca-certificates util-linux >/dev/null 2>&1; do
+      log "apk add failed (mirror not reachable?), retrying in 30s"
+      sleep 30
+    done
 
     # Keep the knfsd allow-list in sync with the Hammerspace Anvil/DSX IPs
     (
@@ -563,9 +580,14 @@ data:
     SENTINEL="${SENTINEL_DIR:-/local/Hammerspace}"
     GRACE_SECONDS="${GRACE_SECONDS:-90}"
     COOLDOWN_SECONDS="${COOLDOWN_SECONDS:-600}"
+    # Seconds between sentinel checks while attached, and between attach retries
+    CHECK_SECONDS="${CHECK_SECONDS:-300}"
+    RETRY_SECONDS="${RETRY_SECONDS:-300}"
+    # The reset deletes the Hammerspace volume (with BYPASS_DECOMMISSION=true that wipes
+    # the Tier0 data on this node). Off by default; run reset-hammerspace-volume.sh by hand,
+    # or set AUTO_RESET=true to get the old behaviour back.
+    AUTO_RESET="${AUTO_RESET:-false}"
     LAST_RESET_FILE="/state/last_reset_epoch"
-
-    log() { echo "[${NODE_NAME:-unknown}][attach] $*" >&2; }
 
     is_mounted() { findmnt -n --target /local >/dev/null 2>&1; }
     mnt_source() { findmnt -n -o SOURCE --target /local 2>/dev/null || true; }
@@ -609,35 +631,48 @@ data:
 
     log "/local mounted OK (source=$src)"
 
-    # SILENT MODE: if sentinel exists, do nothing (no REST call)
-    if [ -d "$SENTINEL" ]; then
-      log "sentinel exists ($SENTINEL) -> ok"
-      tail -f /dev/null
-    fi
+    wait_for_sentinel() {
+      waited=0
+      while [ "$waited" -lt "$GRACE_SECONDS" ]; do
+        [ -d "$SENTINEL" ] && return 0
+        sleep 10; waited=$((waited + 10))
+      done
+      [ -d "$SENTINEL" ]
+    }
 
-    log "sentinel missing -> ensure attach"
-    if /scripts/attach-hammerspace.sh; then
-      log "ensure succeeded, waiting ${GRACE_SECONDS}s for initialization"
-    else
-      log "ensure failed, still waiting ${GRACE_SECONDS}s"
-    fi
+    # Runs forever: silent while the sentinel exists (no REST call), otherwise
+    # (re)attach every RETRY_SECONDS. Never deletes anything unless AUTO_RESET=true.
+    state=""
+    while :; do
+      if [ -d "$SENTINEL" ]; then
+        [ "$state" = ok ] || log "sentinel exists ($SENTINEL) -> ok"
+        state=ok
+        sleep "$CHECK_SECONDS"
+        continue
+      fi
 
-    sleep "$GRACE_SECONDS"
+      [ "$state" = ok ] && log "sentinel disappeared"
+      state=missing
+      log "sentinel missing -> ensure attach"
+      if /scripts/attach-hammerspace.sh; then
+        if wait_for_sentinel; then
+          log "sentinel appeared -> ok"
+          continue
+        fi
+        log "volume added but sentinel still missing after ${GRACE_SECONDS}s"
+      else
+        log "ensure failed"
+      fi
 
-    if [ -d "$SENTINEL" ]; then
-      log "sentinel appeared after grace -> ok"
-      tail -f /dev/null
-    fi
-
-    if cooldown_ok; then
-      log "sentinel still missing after grace -> resetting volume (cooldown ok)"
-      mark_reset
-      /scripts/reset-hammerspace-volume.sh || true
-    else
-      log "sentinel still missing but cooldown active -> not resetting"
-    fi
-
-    tail -f /dev/null
+      if [ "$AUTO_RESET" = true ] && cooldown_ok; then
+        log "AUTO_RESET=true -> resetting volume (cooldown ok)"
+        mark_reset
+        /scripts/reset-hammerspace-volume.sh || true
+      else
+        log "not resetting (AUTO_RESET=$AUTO_RESET), retrying in ${RETRY_SECONDS}s"
+      fi
+      sleep "$RETRY_SECONDS"
+    done
 ---
 apiVersion: apps/v1
 kind: DaemonSet
