@@ -4,6 +4,19 @@ A DaemonSet that exports each Kubernetes worker's local NVMe (`/local`) over NFS
 
 Namespace `storage`, runs on nodes labelled `hammerspace-tier0=enabled`.
 
+## Prototype / known limitations
+
+This is a lab prototype (RKE2 on Rocky Linux 10.2 VMs, Hammerspace 5.3). Review these points before using it anywhere else:
+
+- **Packages are installed at every start.** The `attach` container uses plain `alpine:3.20` and runs `apk add bash curl jq ca-certificates util-linux` on each start (retried every 30 s if the mirror is unreachable). It needs internet access and gets whatever package versions are current. For production, build your own image with these packages and pin it.
+- **Unpinned NFS image.** `itsthenetwork/nfs-server-alpine:latest` is an old third-party image (nfs-utils 2.3.2) and not pinned to a digest.
+- **TLS is not verified.** All Hammerspace API calls use `curl -k`.
+- **Admin credentials.** The API is used with the Hammerspace `admin` user (password from Secret `hammerspace-creds`). A dedicated, less privileged API user would be better.
+- **Lab-specific values.** `HSMGMT_IP` (`10.49.101.50`) in the DaemonSet and the node names in `add-label.sh` are from this lab. The NFS allow-list itself is read from the Hammerspace API (see below).
+- **Privileged and host-wide.** The `knfsd` container is privileged, uses the host network and SELinux type `spc_t`, runs kernel nfsd, and sets host-wide TCP sysctls and the read-ahead of the `/local` device.
+- **`no_root_squash`** is granted to the Hammerspace Anvil/DSX IPs.
+- **Data loss on reset.** `reset-hammerspace-volume.sh` deletes the Hammerspace volume with `bypassDecommission` (`BYPASS_DECOMMISSION=true`), which wipes the Tier0 data on that node. It only runs automatically with `AUTO_RESET=true`.
+
 ## Contents
 
 Source of truth, copied from `k8s-m1:/hammerspace/nfs-server-local`.
